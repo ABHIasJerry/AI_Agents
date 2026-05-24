@@ -1,89 +1,146 @@
 import os
-from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.tools import DuckDuckGoSearchRun
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.chat_history import InMemoryChatMessageHistory
-from langchain_core.runnables.history import RunnableWithMessageHistory
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
 load_dotenv()
 
-# 1. Initialize the Gemini LLM
-# We use gemini-1.5-flash as it is fast and excellent at tool calling
+# --- 1. SHARED CONFIG & DATA STRUCTURES ---
+
+# Final expected output structure for the user
+class FinalAgentResponse(BaseModel):
+    human_response: str = Field(description="The final warm, human-like answer back to the user.")
+    source_used: str = Field(description="Which agent/tool answered this. E.g., 'Weather Worker' or 'Web Search Worker'")
+
+# Internal data structure for the weather specialist
+class WeatherStructure(BaseModel):
+    temperature: float
+    condition: str
+    human_response: str
+
+# Base LLM
 llm = ChatGoogleGenerativeAI(
-    model="gemini-1.5-flash",
-    temperature=0,
+    model="gemini-2.5-flash", 
+    temperature=0.5,
     google_api_key=os.getenv("GEMINI_API_KEY")
 )
 
-# 2. Define the Tools
-# DuckDuckGo search tool
-search_tool = DuckDuckGoSearchRun()
 
-# You can easily add more tools to this list later (e.g., Wikipedia, Arxiv, custom functions)
-tools = [search_tool]
+# --- 2. DEFINE CUSTOM WORKER TOOLS (THE SUB-AGENTS) ---
 
-# 3. Create the Prompt Template with Memory Placeholders
-prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You are a helpful assistant equipped with web search capabilities. "
-            "Always give accurate answers based on the tools provided when needed.",
-        ),
-        # This placeholder is where the conversation history will be injected
-        MessagesPlaceholder(variable_name="chat_history"),
-        ("human", "{input}"),
-        # This placeholder handles the agent's internal scratchpad/thought process
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
+def weather_tool(city: str) -> str:
+    """Get the weather for a city."""
+    return f"it's sunny and 70 degrees in {city}"
+
+def weather_agent_worker(query: str) -> str:
+    """
+    Useful when you need to answer questions specifically about the weather, climate, or forecasts.
+    Input should be the user's raw weather question.
+    """
+    # This worker binds its own specific tools and schema constraint
+    worker_llm_tools = llm.bind_tools([weather_tool])
+    worker_structured_llm = llm.with_structured_output(WeatherStructure)
+    
+    worker_messages = [
+        SystemMessage(content="You are a meteorological expert. Use your weather tool to find facts and format them."),
+        HumanMessage(content=query)
     ]
-)
+    
+    # Tool execution loop inside the worker agent
+    ai_msg = worker_llm_tools.invoke(worker_messages)
+    if ai_msg.tool_calls:
+        worker_messages.append(ai_msg)
+        for tool_call in ai_msg.tool_calls:
+            if tool_call["name"] == "weather_tool":
+                output = weather_tool(**tool_call["args"])
+                worker_messages.append(ToolMessage(content=output, tool_call_id=tool_call["id"]))
+        
+        final_res = worker_structured_llm.invoke(worker_messages)
+    else:
+        final_res = worker_structured_llm.invoke(worker_messages)
+        
+    return f"Weather Worker Result -> Temp: {final_res.temperature}, Condition: {final_res.condition}. Message: {final_res.human_response}"
 
-# 4. Construct the Agent
-# We use the tool-calling agent as Gemini natively supports tool/function calling
-agent = create_tool_calling_agent(llm, tools, prompt)
 
-# 5. Create the Agent Executor
-agent_executor = AgentExecutor(
-    agent=agent, 
-    tools=tools, 
-    verbose=True,  # Set to True to see the agent's "thought" process
-    handle_parsing_errors=True
-)
+def search_agent_worker(query: str) -> str:
+    """
+    Useful when answering general knowledge, news, current events, or non-weather queries.
+    Input should be a search query optimization string.
+    """
+    ddg_search = DuckDuckGoSearchRun()
+    search_result = ddg_search.run(query)
+    
+    search_messages = [
+        SystemMessage(content="You are a research expert. Synthesize raw search results into a clean summary."),
+        HumanMessage(content=f"Summarize this finding to answer the user's intent: {search_result}")
+    ]
+    
+    res = llm.invoke(search_messages)
+    return f"Search Worker Result -> {res.content}"
 
-# 6. Manage Memory / Chat History
-# We use a dictionary to store histories so you can manage multiple sessions/users
-session_memories = {}
 
-def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
-    if session_id not in session_memories:
-        session_memories[session_id] = InMemoryChatMessageHistory()
-    return session_memories[session_id]
+# --- 3. SUPERVISOR AGENT CONFIGURATION ---
 
-# Wrap the agent executor with message history capabilities
-agent_with_chat_history = RunnableWithMessageHistory(
-    agent_executor,
-    get_session_history,
-    input_messages_key="input",
-    history_messages_key="chat_history",
-)
+# Compile workers into a tool array for the Supervisor
+agent_tools = [weather_agent_worker, search_agent_worker]
 
-# --- Verification & Execution ---
+# Bind tools to Supervisor so it can delegate tasks
+supervisor_llm_with_tools = llm.bind_tools(agent_tools)
+# Force Supervisor to format the definitive final summary response
+supervisor_structured_output = llm.with_structured_output(FinalAgentResponse)
+
+
+# --- 4. EXECUTION FLOW ---
+
+def run_multi_agent_system(user_prompt: str):
+    print(f"\nUser Request: '{user_prompt}'")
+    
+    session_messages = [
+        SystemMessage(
+            content="You are a team Supervisor. You do not answer questions directly. "
+                    "Delegate tasks to your sub-agents (weather_agent_worker or search_agent_worker) "
+                    "using tools, collect their findings, and format the absolute final result."
+        ),
+        HumanMessage(content=user_prompt)
+    ]
+    
+    # Supervisor decides who should handle the input
+    supervisor_decision = supervisor_llm_with_tools.invoke(session_messages)
+    
+    if supervisor_decision.tool_calls:
+        session_messages.append(supervisor_decision)
+        
+        for tool_call in supervisor_decision.tool_calls:
+            # Dynamically execute the chosen sub-agent worker function
+            chosen_worker = next(t for t in agent_tools if t.__name__ == tool_call["name"])
+            print(f"[Supervisor] Routing task to: {chosen_worker.__name__}...")
+            
+            worker_output = chosen_worker(**tool_call["args"])
+            
+            # Pass the worker sub-agent's findings back to supervisor history
+            session_messages.append(ToolMessage(content=worker_output, tool_call_id=tool_call["id"]))
+            
+        # Supervisor builds final schema output using the aggregated workers' data
+        final_verdict = supervisor_structured_output.invoke(session_messages)
+    else:
+        # If no sub-agent was needed, compile directly
+        final_verdict = supervisor_structured_output.invoke(session_messages)
+        
+    return final_verdict
+
+
+# --- 5. VERIFICATION ---
 if __name__ == "__main__":
-    config = {"configurable": {"session_id": "user_session_1"}}
+    # Test 1: Triggers Weather Agent
+    res1 = run_multi_agent_system("Is it raining in San Francisco right now?")
+    print(f"Human Response: {res1.human_response}")
+    print(f"Backend Meta: {repr(res1)}\n")
+    
+    print("-" * 50)
 
-    # Turn 1: Asking for real-time information (triggers the search tool)
-    print("--- Turn 1 ---")
-    response1 = agent_with_chat_history.invoke(
-        {"input": str(input("Enter your query: "))},
-        config=config
-    )
-    print(f"\nAI Response: {response1['output']}\n")
-
-    # Turn 2: Testing memory (referencing the previous turn)
-    print("--- Turn 2 (Testing Memory) ---")
-    response2 = agent_with_chat_history.invoke(
-        {"input": "What company did I just ask you about?"},
-        config=config
-    )
-    print(f"\nAI Response: {response2['output']}\n")
+    # Test 2: Triggers Web Search Agent
+    res2 = run_multi_agent_system("Who won the latest Formula 1 Monaco Grand Prix?")
+    print(f"Human Response: {res2.human_response}")
+    print(f"Backend Meta: {repr(res2)}")
