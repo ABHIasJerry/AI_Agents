@@ -1,4 +1,8 @@
 langchain
-openai
+pydantic 
 python-dotenv
+requests
+google-generativeai
+langchain_community
 pip install --upgrade langchain-google-genai langchain-core langgraph pydantic
+pip install -U ddgs
