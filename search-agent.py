@@ -1,71 +1,65 @@
-# IMPORTS
-from langchain.agents import initialize_agent, Tool
-from langchain.agents.agent_types import AgentType
-from langchain.llms import OpenAI
-from langchain.tools import DuckDuckGoSearchRun
-from langchain.memory import ConversationBufferMemory
-from langchain.utilities import WikipediaAPIWrapper
-from langchain.utilities import GoogleSerperAPIWrapper
-from langchain_google_genai import ChatGoogleGenerativeAI
-from dotenv import load_dotenv
+
 import os
-
-# LOAD ENVIRONMENT VARIABLES
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 load_dotenv()
-key = os.getenv("OPENAI_API_KEY")
-google_api_key = os.getenv("GEMINI_API_KEY")  # Gemini API key
 
-# # LLM SETUP
-# llm = OpenAI(temperature=0, openai_api_key=key)
+# 1. Update the schema to include a human-like response field
+class WeatherResponse(BaseModel):
+    temperature: float = Field(description="The numeric temperature value in Fahrenheit")
+    condition: str = Field(description="The weather condition description (e.g., sunny, rainy)")
+    human_response: str = Field(description="A warm, natural, human-like conversational response answering the user's question.")
 
-# LLM SETUP (Gemini instead of OpenAI)
+# 2. Tool function definition
+def weather_tool(city: str) -> str:
+    """Get the weather for a city."""
+    return f"it's sunny and 70 degrees in {city}"
+
+# 3. Initialize the model 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-1.5-flash",   # you can also try "gemini-1.5-pro" or "gemini-1.5-flash" or "gemini-pro"
-    temperature=0,
-    google_api_key=google_api_key
+    model="gemini-2.5-flash", 
+    temperature=0.7,  # Raised slightly from 0 to make the phrasing more natural/creative
+    google_api_key=os.getenv("GEMINI_API_KEY")
 )
 
-# MEMORY SETUP (remembers past conversation turns)
-memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+# 4. Bind tools to the base LLM first
+llm_with_tools = llm.bind_tools([weather_tool])
 
-# TOOLS SETUP
-search = DuckDuckGoSearchRun()
-wiki = WikipediaAPIWrapper()
-google_search = GoogleSerperAPIWrapper()
+# 5. Apply the expanded schema constraint second
+structured_llm = llm.with_structured_output(WeatherResponse)
 
-tools = [
-    Tool(
-        name="DuckDuckGo Search",
-        func=search.run,
-        description="Useful for answering questions about current events or general web queries."
+# 6. Initialize message session context
+messages = [
+    SystemMessage(
+        content="You are a friendly, conversational assistant. Look up local conditions using tools, "
+                "and provide a warm, human-like response alongside the required data structures."
     ),
-    Tool(
-        name="Wikipedia",
-        func=wiki.run,
-        description="Useful for factual and historical information."
-    ),
-    Tool(
-        name="Google Search",
-        func=google_search.run,
-        description="Useful for broader search queries with more detailed results."
-    )
+    HumanMessage(content="What's the weather like in SF right now?")
 ]
 
-# CUSTOMIZE AGENT BEHAVIOR
-agent = initialize_agent(
-    tools,
-    llm,
-    agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,  # conversational agent
-    memory=memory,  # adds memory
-    verbose=True,
-    handle_parsing_errors=True  # makes agent more robust
-)
+# Step 1: Query the model with tool access
+ai_message = llm_with_tools.invoke(messages)
 
-# RUN AGENT LOOP
-while True:
-    query = input("Enter your query (or type 'exit' to quit): ")
-    if query.lower() == "exit":
-        print("Goodbye!")
-        break
-    response = agent.run(query)
-    print("Agent Response: -> ", response)
+# Step 2: Check if tool calling was triggered
+if ai_message.tool_calls:
+    messages.append(ai_message)
+    
+    for tool_call in ai_message.tool_calls:
+        if tool_call["name"] == "weather_tool":
+            tool_output = weather_tool(**tool_call["args"])
+            messages.append(ToolMessage(content=tool_output, tool_call_id=tool_call["id"]))
+    
+    # Step 3: Get the final structured output containing both the data and the prose
+    final_output = structured_llm.invoke(messages)
+else:
+    final_output = structured_llm.invoke(messages)
+
+# --- Output the results ---
+
+print("--- Conversational Output (Agent Response) ---")
+print(final_output.human_response)
+
+print("\n--- Structured Object (Agent receives from backend) ---")
+print(repr(final_output))
