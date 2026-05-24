@@ -1,3 +1,4 @@
 langchain
 openai
 python-dotenv
+pip install --upgrade langchain-google-genai langchain-core langgraph pydantic
